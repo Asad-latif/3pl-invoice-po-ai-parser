@@ -1,0 +1,511 @@
+{
+  "name": "Enterprise Logistics & Financial Email Processing Pipeline (Complete Fix)",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "simple": false,
+        "filters": {
+          "readStatus": "unread"
+        },
+        "options": {
+          "downloadAttachments": true
+        }
+      },
+      "id": "node-1-email-trigger",
+      "name": "1. Email Trigger (Gmail/IMAP)",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1,
+      "position": [
+        100,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $env.AUTOMATION_ENABLED ?? 'true' }}",
+              "value2": "true"
+            }
+          ]
+        }
+      },
+      "id": "node-2-kill-switch",
+      "name": "2. Global Emergency Kill-Switch",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        320,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================================\n// STAGE 1 FILTER: HYGIENE, SPAM, AUTO-REPLY & SHA-256 DEDUPLICATION\n// ============================================================================\nconst crypto = require('crypto');\n\nconst items = $input.all();\nconst output = [];\n\nconst hardDropSenders = /(no-reply|noreply|donotreply|do-not-reply|mailer-daemon|postmaster|marketing|newsletter|sales@)/i;\nconst autoReplySubjects = /(out\\s+of\\s+office|auto-reply|automatic\\s+reply|undelivered\\s+mail|delivery\\s+status\\s+notification)/i;\n\nfor (const item of items) {\n  const json = item.json || {};\n  const sender = (json.from || json.sender || \"\").toLowerCase();\n  const subject = (json.subject || \"\").toLowerCase();\n  \n  // 1. Drop obvious spam/marketing\n  if (hardDropSenders.test(sender)) {\n    item.json.dropReason = \"SPAM_MARKETING_SENDER\";\n    item.json.pipelineStatus = \"SPAM_DROPPED\";\n    continue;\n  }\n\n  // 2. Reroute auto-replies unless an attachment is present\n  const hasAttachments = Boolean(item.binary && Object.keys(item.binary).length > 0);\n  if (autoReplySubjects.test(subject) && !hasAttachments) {\n    item.json.dropReason = \"AUTO_REPLY_NO_ATTACHMENT\";\n    item.json.pipelineStatus = \"AUTO_REPLY_LOGGED\";\n    continue;\n  }\n\n  // 3. Compute SHA-256 Hashes for duplicate detection\n  const hashes = [];\n  if (hasAttachments) {\n    for (const key of Object.keys(item.binary)) {\n      const base64Data = item.binary[key].data || \"\";\n      const hash = crypto.createHash('sha256').update(base64Data).digest('hex');\n      hashes.push(hash);\n    }\n  }\n  item.json.attachmentHashes = hashes;\n  item.json.stage1Passed = true;\n  output.push(item);\n}\n\nreturn output;"
+      },
+      "id": "node-3-stage1-filter",
+      "name": "3. STAGE 1 FILTER: Hygiene & Hashes",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        540,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================================\n// STAGE 2 FILTER: QUALIFICATION, ROUTING & SIZE CHECK\n// ============================================================================\nconst items = $input.all();\nconst output = [];\n\nconst coreKeywords = /\\b(invoice|invoices|invoicing|billable|billed|remittance|remit|voucher|statement|surcharge|demurrage|detention|drayage|lumper|accessorial|ratecon|manifest|waybill|freight)\\b/i;\nconst shorthandPatterns = /\\b(inv|bill|bol|pod|po|so|awb|cmr)[\\s:#\\-_0-9]/i;\n\nconst MAX_FILE_SIZE_BYTES = 15 * 1024 * 1024; // 15MB threshold\n\nfor (const item of items) {\n  const json = item.json || {};\n  const subject = (json.subject || \"\").toLowerCase();\n  const body = (json.textPlain || json.text || json.snippet || \"\").toLowerCase();\n  const hasAttachments = Boolean(item.binary && Object.keys(item.binary).length > 0);\n\n  let isOverSize = false;\n  if (hasAttachments) {\n    for (const key of Object.keys(item.binary)) {\n      const size = item.binary[key].fileSize || 0;\n      if (size > MAX_FILE_SIZE_BYTES) {\n        isOverSize = true;\n        break;\n      }\n    }\n  }\n\n  if (isOverSize) {\n    item.json.routeGroup = \"LARGE_FILE_TRIAGE\";\n    item.json.confidenceTag = \"EXCEEDS_MAX_SIZE\";\n    output.push(item);\n    continue;\n  }\n\n  const hasKeywords = coreKeywords.test(subject) || \n                      coreKeywords.test(body) || \n                      shorthandPatterns.test(subject) || \n                      shorthandPatterns.test(body);\n\n  if (hasAttachments) {\n    item.json.routeGroup = \"ATTACHMENT_PIPELINE\";\n    item.json.confidenceTag = hasKeywords ? \"HIGH_SIGNAL_ATTACHMENT\" : \"UNLABELED_ATTACHMENT\";\n    output.push(item);\n  } else {\n    if (hasKeywords) {\n      item.json.routeGroup = \"AI_BODY_PIPELINE\";\n      item.json.confidenceTag = \"HIGH_SIGNAL_TEXT\";\n      output.push(item);\n    } else {\n      item.json.routeGroup = \"JEV_FAST_CLASSIFIER\";\n      item.json.confidenceTag = \"AMBIGUOUS_TEXT\";\n      output.push(item);\n    }\n  }\n}\n\nreturn output;"
+      },
+      "id": "node-4-stage2-filter",
+      "name": "4. STAGE 2 FILTER: Qualification & Size Check",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        760,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "column": "={{ $json.routeGroup }}",
+              "value": "LARGE_FILE_TRIAGE"
+            },
+            {
+              "column": "={{ $json.routeGroup }}",
+              "value": "ATTACHMENT_PIPELINE"
+            },
+            {
+              "column": "={{ $json.routeGroup }}",
+              "value": "AI_BODY_PIPELINE"
+            },
+            {
+              "column": "={{ $json.routeGroup }}",
+              "value": "JEV_FAST_CLASSIFIER"
+            }
+          ]
+        }
+      },
+      "id": "node-5-route-switch",
+      "name": "5. Route Switcher",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 1,
+      "position": [
+        980,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO pending_human_approvals (message_id, sender, subject, file_size_status, human_instruction_status) VALUES ($1, $2, $3, 'EXCEEDS_15MB', 'AWAITING_HUMAN_DIRECTION');",
+        "queryParams": "={{ [$json.id || '', $json.from || '', $json.subject || ''] }}"
+      },
+      "id": "node-6-large-file-logger",
+      "name": "6. Log Large File Approval Request",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 1,
+      "position": [
+        1200,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.fast-classifier.internal/v1/classify",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"text\": \"Subject: {{ $json.subject }} \\n Body: {{ $json.snippet }}\",\n  \"prompt\": \"Is this email directly requesting freight/logistics invoice processing, payment reconciliation, or document verification? Answer YES or NO.\"\n}",
+        "options": {
+          "timeout": 3000
+        }
+      },
+      "id": "node-7-jev-fast-classifier",
+      "name": "7. JEV Fast Classifier",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        1200,
+        500
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================================\n// JEV EVALUATOR & FALLBACK HANDLER\n// ============================================================================\nconst items = $input.all();\nconst output = [];\n\nfor (const item of items) {\n  if (item.json.error) {\n    item.json.routeGroup = \"AI_BODY_PIPELINE\";\n    item.json.jevStatus = \"JEV_TIMEOUT_FALLBACK\";\n    output.push(item);\n    continue;\n  }\n\n  const classification = (item.json.result || item.json.classification || \"\").toString().toUpperCase();\n  if (classification.includes(\"YES\")) {\n    item.json.routeGroup = \"AI_BODY_PIPELINE\";\n    item.json.jevStatus = \"CLASSIFIED_YES\";\n    output.push(item);\n  } else {\n    item.json.routeGroup = \"HUMAN_TRIAGE\";\n    item.json.jevStatus = \"CLASSIFIED_NO\";\n    item.json.dbStatus = \"HUMAN_TRIAGE_QUEUE\";\n    output.push(item);\n  }\n}\n\nreturn output;"
+      },
+      "id": "node-7b-jev-fallback-handler",
+      "name": "7b. JEV Evaluator & Fallback Handler",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1380,
+        500
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "column": "={{ $json.routeGroup }}",
+              "value": "HUMAN_TRIAGE"
+            },
+            {
+              "column": "={{ $json.routeGroup }}",
+              "value": "AI_BODY_PIPELINE"
+            }
+          ]
+        }
+      },
+      "id": "node-7c-triage-filter",
+      "name": "7c. Filter Out Human Triage",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 1,
+      "position": [
+        1560,
+        500
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO human_triage_queue (message_id, sender, subject, reason) VALUES ($1, $2, $3, 'JEV_CLASSIFIED_NO');",
+        "queryParams": "={{ [$json.id || '', $json.from || '', $json.subject || ''] }}"
+      },
+      "id": "node-7d-human-triage-logger",
+      "name": "7d. Log Human Triage Queue",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 1,
+      "position": [
+        1740,
+        600
+      ]
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "node-8-concurrency-guard",
+      "name": "8. AI Concurrency Guard (Batch: 1)",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1740,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "column": "={{ $json.routeGroup }}",
+              "value": "ATTACHMENT_PIPELINE"
+            },
+            {
+              "column": "={{ $json.routeGroup }}",
+              "value": "AI_BODY_PIPELINE"
+            }
+          ]
+        }
+      },
+      "id": "node-8b-model-router",
+      "name": "8b. Model Router",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 1,
+      "position": [
+        1920,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-1.5-pro",
+        "options": {
+          "temperature": 0
+        }
+      },
+      "id": "node-9-gemini-vision",
+      "name": "9. Gemini Vision Extraction (Attachments)",
+      "type": "n8n-nodes-base.googlePaLM",
+      "typeVersion": 1,
+      "position": [
+        2120,
+        200
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o",
+        "options": {
+          "temperature": 0
+        }
+      },
+      "id": "node-10-text-llm",
+      "name": "10. Text LLM Parsing (Body Emails)",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 1,
+      "position": [
+        2120,
+        400
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================================\n// NORMALIZER & SCHEMA VALIDATOR\n// ============================================================================\nconst items = $input.all();\nconst output = [];\n\nfor (const item of items) {\n  let rawContent = item.json.message?.content || item.json.content || item.json.text || item.json.output || \"\";\n  \n  if (typeof rawContent === 'object') {\n    rawContent = JSON.stringify(rawContent);\n  }\n\n  // Strip Markdown Code Fences (e.g. ```json ... ```)\n  if (typeof rawContent === 'string') {\n    rawContent = rawContent.replace(/```json\\s*/gi, '').replace(/```\\s*/g, '').trim();\n  }\n\n  let parsedData = {};\n  try {\n    parsedData = JSON.parse(rawContent);\n  } catch (e) {\n    parsedData = {};\n  }\n\n  const requiredFields = ['vendor_name', 'total_amount'];\n  const hasRequiredFields = requiredFields.every(field => Boolean(parsedData[field]));\n\n  if (!hasRequiredFields) {\n    item.json.validationStatus = \"SCHEMA_VALIDATION_FAILED\";\n    item.json.dbStatus = \"FAILED_DLQ_TRIAGE\";\n  } else {\n    item.json.validationStatus = \"VALIDATED\";\n    item.json.dbStatus = \"PENDING_HUMAN_REVIEW\";\n  }\n  \n  item.json.normalizedPayload = parsedData;\n  output.push(item);\n}\n\nreturn output;"
+      },
+      "id": "node-11-normalizer-validator",
+      "name": "11. Normalizer & Schema Validator",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2340,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO logistics_staging (message_id, sender, vendor_name, total_amount, payload_json, status) VALUES ($1, $2, $3, $4, $5::jsonb, $6);",
+        "queryParams": "={{ [$json.id || '', $json.from || '', $json.normalizedPayload?.vendor_name || '', $json.normalizedPayload?.total_amount || 0, JSON.stringify($json.normalizedPayload || {}), $json.dbStatus || 'FAILED_DLQ_TRIAGE'] }}"
+      },
+      "id": "node-12-staging-db-insert",
+      "name": "12. Insert Staging DB (PENDING_HUMAN_REVIEW / DLQ)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 1,
+      "position": [
+        2560,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    }
+  ],
+  "connections": {
+    "1. Email Trigger (Gmail/IMAP)": {
+      "main": [
+        [
+          {
+            "node": "2. Global Emergency Kill-Switch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "2. Global Emergency Kill-Switch": {
+      "main": [
+        [
+          {
+            "node": "3. STAGE 1 FILTER: Hygiene & Hashes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "3. STAGE 1 FILTER: Hygiene & Hashes": {
+      "main": [
+        [
+          {
+            "node": "4. STAGE 2 FILTER: Qualification & Size Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "4. STAGE 2 FILTER: Qualification & Size Check": {
+      "main": [
+        [
+          {
+            "node": "5. Route Switcher",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "5. Route Switcher": {
+      "main": [
+        [
+          {
+            "node": "6. Log Large File Approval Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "8. AI Concurrency Guard (Batch: 1)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "8. AI Concurrency Guard (Batch: 1)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "7. JEV Fast Classifier",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "7. JEV Fast Classifier": {
+      "main": [
+        [
+          {
+            "node": "7b. JEV Evaluator & Fallback Handler",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "7b. JEV Evaluator & Fallback Handler",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "7b. JEV Evaluator & Fallback Handler": {
+      "main": [
+        [
+          {
+            "node": "7c. Filter Out Human Triage",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "7c. Filter Out Human Triage": {
+      "main": [
+        [
+          {
+            "node": "7d. Log Human Triage Queue",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "8. AI Concurrency Guard (Batch: 1)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "8. AI Concurrency Guard (Batch: 1)": {
+      "main": [
+        [
+          {
+            "node": "8b. Model Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "8b. Model Router": {
+      "main": [
+        [
+          {
+            "node": "9. Gemini Vision Extraction (Attachments)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "10. Text LLM Parsing (Body Emails)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "9. Gemini Vision Extraction (Attachments)": {
+      "main": [
+        [
+          {
+            "node": "11. Normalizer & Schema Validator",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "10. Text LLM Parsing (Body Emails)": {
+      "main": [
+        [
+          {
+            "node": "11. Normalizer & Schema Validator",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "11. Normalizer & Schema Validator": {
+      "main": [
+        [
+          {
+            "node": "12. Insert Staging DB (PENDING_HUMAN_REVIEW / DLQ)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12. Insert Staging DB (PENDING_HUMAN_REVIEW / DLQ)": {
+      "main": [
+        [
+          {
+            "node": "8. AI Concurrency Guard (Batch: 1)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}
